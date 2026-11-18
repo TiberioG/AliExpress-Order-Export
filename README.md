@@ -94,3 +94,47 @@ uv run aliexpress_export.py \
 - The main order CSV is row-oriented and keeps the full AliExpress payloads in JSON columns. The separate order-line CSV is the easiest place to inspect product titles.
 - The XLSX workbook is optional and keeps thumbnails in a dedicated `Thumbnail` column. If image downloads fail, the workbook is still written without those embedded images.
 - Some sessions may expire and require a fresh HAR or Firefox-cookie import.
+
+
+## Resuming interrupted exports
+
+Live exports automatically save a private checkpoint in the output directory after
+each order-list page, completed order detail, invoice lookup and downloaded PDF.
+Run the same command again to resume. Use the same date range, output directory,
+cookie-file path and locale options. You can increase the page limit or enable
+PDF downloads on a subsequent run.
+
+The exporter walks the list again to discover orders without reusing an old
+pagination cursor. Successfully checkpointed details and invoice lookups are
+reused. Failed requests remain pending. Existing PDF files are checked for their
+PDF header and reused. A successful invoice lookup with no invoices is saved as
+an empty result.
+
+During a live export, the CSV files are partial views of the checkpoint. Their
+presence does not prove that all requested pages, details or invoices completed.
+Order and system/authentication failures stop the run with a nonzero exit status
+and preserve prior progress. Other invoice failures remain pending while later
+orders continue. The run exits nonzero after saving those results, and the next
+run retries pending invoice operations.
+Reaching the page limit prints an incomplete-coverage warning. XLSX output is
+produced after successful processing.
+
+AliExpress token-expired responses trigger one bootstrap and freshly signed
+retry, using updated response cookies. A repeated token error or expired login
+still stops the export. In that case, sign in and run `--setup` manually, then
+rerun the export. The session cookies are saved even after a failed request.
+
+Use a separate output directory for each account. Checkpoints contain private
+purchase data and are intended for retries of the same snapshot. To refresh
+completed order details/statuses, check for newly available invoices, or change
+accounts, start with a new output directory. Concurrent live exports to one
+output directory are rejected by an OS file lock. Use a separate cookie file
+for independent concurrent collectors.
+
+Checkpoint and PDF replacement is atomic. If interrupted between a checkpoint
+write and CSV generation, rerunning regenerates the CSVs from the checkpoint.
+
+Offline recovery tests cover token rotation, bounded retries, interrupted details
+and invoice/PDF retrieval, repeated pagination, settings mismatches and interrupted
+file replacement. Live token recovery still requires validation against a
+user-run export.

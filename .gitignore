@@ -9,3 +9,10 @@ tests/__pycache__/
 .uv-cache/
 .venv/
 .playwright-browsers/
+
+# Private resumable exports, including custom output directories
+checkpoint_*.json
+.export.lock
+aliexpress_orders_*.csv
+aliexpress_order_lines_*.csv
+invoice_*.pdf

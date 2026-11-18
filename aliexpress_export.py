@@ -22,7 +22,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -316,10 +316,16 @@ def compact_json(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 
 
+class MtopError(RuntimeError):
+    def __init__(self, api_name: str, ret: list[Any]) -> None:
+        super().__init__(f"{api_name} failed: {ret}")
+        self.system_failure = any(str(value).startswith("FAIL_SYS_") for value in ret)
+
+
 def ensure_successful_mtop(payload: dict[str, Any], api_name: str) -> dict[str, Any]:
     ret = payload.get("ret") or []
     if ret and not any(str(item).startswith("SUCCESS") for item in ret):
-        raise RuntimeError(f"{api_name} failed: {ret}")
+        raise MtopError(api_name, ret)
     data = payload.get("data")
     if not isinstance(data, dict):
         raise RuntimeError(f"{api_name} returned no data payload.")
@@ -678,13 +684,9 @@ def detect_installed_browser_profiles(
         if app_path is None or not support_dir.exists():
             continue
         if meta["family"] == "firefox":
-            profiles.extend(
-                detect_firefox_profiles(browser_id, meta["label"], support_dir)
-            )
+            profiles.extend(detect_firefox_profiles(browser_id, meta["label"], support_dir))
         else:
-            profiles.extend(
-                detect_chromium_profiles(browser_id, meta["label"], support_dir)
-            )
+            profiles.extend(detect_chromium_profiles(browser_id, meta["label"], support_dir))
     return profiles
 
 
@@ -1466,7 +1468,17 @@ class AliExpressMtopClient:
         raw = f"{self._token()}&{timestamp}&{app_key}&{data}"
         return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
-    def _request(
+    def _request(self, api_name: str, data: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        payload = self._request_once(api_name, data, **kwargs)
+        codes = {str(value).split("::", 1)[0] for value in payload.get("ret", [])}
+        if codes.intersection({"FAIL_SYS_TOKEN_EXOIRED", "FAIL_SYS_TOKEN_EXPIRED"}):
+            # curl has already loaded any Set-Cookie updates. Bootstrap also gives
+            # the site a chance to refresh the token before we sign a fresh request.
+            self.bootstrap()
+            payload = self._request_once(api_name, data, **kwargs)
+        return payload
+
+    def _request_once(
         self,
         api_name: str,
         data: dict[str, Any],
@@ -1695,22 +1707,116 @@ def maybe_write_pdf(path: Path, content: bytes) -> bool:
     return True
 
 
+def atomic_write(path: Path, content: bytes) -> None:
+    """Replace a private file only after its new contents have reached disk."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+class ExportCheckpoint:
+    def __init__(self, config: argparse.Namespace, cookies_path: Path, pdf_dir: Path) -> None:
+        self.start = parse_iso_date(config.start_date)
+        self.end = parse_iso_date(config.end_date)
+        self.directory = pdf_dir.parent
+        self.path = self.directory / f"checkpoint_{self.start}_to_{self.end}.json"
+        self.scope = {
+            "start": config.start_date,
+            "end": config.end_date,
+            "cookies_path": str(cookies_path.resolve()),
+            "ship_to_country": config.ship_to_country,
+            "lang": config.lang,
+            "time_zone": config.time_zone,
+        }
+        self.store = OrderStore()
+        self.details_done: set[str] = set()
+        self.invoices_done: set[str] = set()
+        if self.path.exists():
+            saved = json.loads(self.path.read_text(encoding="utf-8"))
+            if saved.get("version") != 1 or saved.get("scope") != self.scope:
+                raise RuntimeError("Checkpoint settings differ; use a new output directory.")
+            self.store.orders = {
+                key: OrderBundle(**value) for key, value in saved["orders"].items()
+            }
+            self.details_done = set(saved["details_done"])
+            self.invoices_done = set(saved["invoices_done"])
+
+    def save(self) -> None:
+        saved = {
+            "version": 1,
+            "scope": self.scope,
+            "orders": {key: asdict(value) for key, value in self.store.orders.items()},
+            "details_done": sorted(self.details_done),
+            "invoices_done": sorted(self.invoices_done),
+        }
+        atomic_write(self.path, json.dumps(saved, ensure_ascii=False).encode("utf-8"))
+        # CSVs are readable partial results. The checkpoint is the recovery authority.
+        bundles = self.store.filtered(self.start, self.end)
+        for destination, writer in (
+            (build_csv_path(self.directory, self.start, self.end), write_orders_csv),
+            (
+                build_order_lines_csv_path(self.directory, self.start, self.end),
+                write_order_lines_csv,
+            ),
+        ):
+            fd, temporary = tempfile.mkstemp(dir=self.directory, suffix=".csv")
+            os.close(fd)
+            try:
+                writer(Path(temporary), bundles)
+                os.replace(temporary, destination)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+
+
 def export_live(config: argparse.Namespace, cookies_path: Path, pdf_dir: Path) -> OrderStore:
-    cookies = load_cookies(cookies_path)
+    # Lock the output directory for this process. OS locks are released after a crash.
+    lock_path = pdf_dir.parent / ".export.lock"
+    with lock_path.open("a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+
+            lock.seek(0)
+            lock.write(b"0")
+            lock.flush()
+            lock.seek(0)
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise RuntimeError("Another export is using this output directory.") from exc
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError("Another export is using this output directory.") from exc
+        return export_live_locked(config, cookies_path, pdf_dir)
+
+
+def export_live_locked(config: argparse.Namespace, cookies_path: Path, pdf_dir: Path) -> OrderStore:
+    checkpoint = ExportCheckpoint(config, cookies_path, pdf_dir)
+    store = checkpoint.store
     client = AliExpressMtopClient(
-        cookies,
+        load_cookies(cookies_path),
         ship_to_country=config.ship_to_country,
         lang=config.lang,
         time_zone=config.time_zone,
     )
-    store = OrderStore()
     try:
         client.bootstrap()
-        oldest_seen: Optional[date] = None
+        # Discover afresh: stored order counts must not trigger the repeated-page guard.
+        discovered = OrderStore()
         last_reported_page_index: Optional[int] = None
         previous_list_payload: Optional[dict[str, Any]] = None
         for page_index in range(1, config.max_pages + 1):
-            before_count = len(store.orders)
+            before_count = len(discovered.orders)
             if page_index == 1:
                 payload = client.fetch_order_list_page(page_index, config.page_size)
             else:
@@ -1721,15 +1827,16 @@ def export_live(config: argparse.Namespace, cookies_path: Path, pdf_dir: Path) -
                     page_index,
                     config.page_size,
                 )
+            metadata = parse_order_list_payload(payload, discovered)
             previous_list_payload = payload
-            metadata = parse_order_list_payload(payload, store)
-            after_count = len(store.orders)
+            for order in discovered.orders.values():
+                store.add_list_fields(order.order_id, order.list_fields)
+            checkpoint.save()
+            after_count = len(discovered.orders)
             new_orders = after_count - before_count
-            page_orders = list(store.orders.values())
-            parsed_dates = [resolve_order_date(order) for order in page_orders]
+            parsed_dates = [resolve_order_date(order) for order in discovered.orders.values()]
             parsed_dates = [item for item in parsed_dates if item is not None]
-            if parsed_dates:
-                oldest_seen = min(parsed_dates)
+            oldest_seen = min(parsed_dates) if parsed_dates else None
             reported_page_index = parse_optional_int(metadata.get("pageIndex"))
             print(
                 f"Fetched order list page {page_index}: "
@@ -1745,42 +1852,69 @@ def export_live(config: argparse.Namespace, cookies_path: Path, pdf_dir: Path) -
                 last_reported_page_index = reported_page_index
             if not metadata.get("hasMore"):
                 break
-            if oldest_seen and oldest_seen < parse_iso_date(config.start_date):
+            if oldest_seen and oldest_seen < checkpoint.start:
                 break
+        else:
+            print("Page limit reached; date-range coverage may be incomplete.")
 
-        filtered_orders = store.filtered(
-            parse_iso_date(config.start_date),
-            parse_iso_date(config.end_date),
-        )
-        for bundle in filtered_orders:
-            detail_payload = client.fetch_order_detail(bundle.order_id)
-            parse_order_detail_payload(detail_payload, store)
-            try:
-                invoice_payload = client.fetch_invoice_info(bundle.order_id)
-                parse_invoice_info_payload(invoice_payload, bundle.order_id, store)
-            except Exception:
-                continue
-
-        if config.download_pdfs:
-            for bundle in store.filtered(
-                parse_iso_date(config.start_date),
-                parse_iso_date(config.end_date),
-            ):
+        pending_documents = 0
+        for bundle in store.filtered(checkpoint.start, checkpoint.end):
+            if bundle.order_id not in checkpoint.details_done:
+                detail_payload = client.fetch_order_detail(bundle.order_id)
+                detail_id = parse_order_detail_payload(detail_payload, store)
+                if detail_id != bundle.order_id:
+                    raise RuntimeError("Order detail response did not match the requested order.")
+                checkpoint.details_done.add(bundle.order_id)
+                checkpoint.save()
+            if bundle.order_id not in checkpoint.invoices_done:
+                try:
+                    invoice_payload = client.fetch_invoice_info(bundle.order_id)
+                    parse_invoice_info_payload(invoice_payload, bundle.order_id, store)
+                except (RuntimeError, OSError, ValueError) as error:
+                    if isinstance(error, MtopError) and error.system_failure:
+                        raise
+                    pending_documents += 1
+                    print(f"Invoice lookup pending ({type(error).__name__}); continuing.")
+                    continue
+                checkpoint.invoices_done.add(bundle.order_id)
+                checkpoint.save()
+            if config.download_pdfs:
                 for index, invoice in enumerate(bundle.invoice_info_list):
                     pdf_path = invoice_pdf_path(pdf_dir, bundle.order_id, invoice, index)
-                    if pdf_path.exists():
-                        store.add_invoice_pdf_path(bundle.order_id, pdf_path)
-                        continue
-                    try:
-                        pdf_content = client.fetch_invoice_file(bundle.order_id, invoice)
-                    except Exception:
-                        continue
-                    if maybe_write_pdf(pdf_path, pdf_content):
-                        store.add_invoice_pdf_path(bundle.order_id, pdf_path)
-
-        save_cookies(cookies_path, client.export_cookies())
+                    if not pdf_path.exists() or not pdf_path.read_bytes().startswith(b"%PDF"):
+                        try:
+                            pdf_content = client.fetch_invoice_file(bundle.order_id, invoice)
+                            if not pdf_content.startswith(b"%PDF"):
+                                raise RuntimeError("Invoice response was not a PDF.")
+                        except (RuntimeError, OSError, ValueError) as error:
+                            if isinstance(error, MtopError) and error.system_failure:
+                                raise
+                            pending_documents += 1
+                            print(f"Invoice download pending ({type(error).__name__}); continuing.")
+                            continue
+                        atomic_write(pdf_path, pdf_content)
+                    store.add_invoice_pdf_path(bundle.order_id, pdf_path)
+                    checkpoint.save()
     finally:
-        client.close()
+        try:
+            # Preserve cookies rotated by a response even when a later request fails.
+            atomic_write(
+                cookies_path,
+                json.dumps(dedupe_cookies(client.export_cookies())).encode("utf-8"),
+            )
+        finally:
+            client.close()
+    checkpoint.save()
+    if pending_documents:
+        raise RuntimeError(
+            f"{pending_documents} invoice operation(s) remain pending. "
+            "Other progress is saved; rerun the same command to retry."
+        )
+    if config.xlsx:
+        write_xlsx(
+            build_xlsx_path(checkpoint.directory, checkpoint.start, checkpoint.end),
+            store.filtered(checkpoint.start, checkpoint.end),
+        )
     return store
 
 
@@ -1892,10 +2026,11 @@ def run_export(config: argparse.Namespace) -> int:
         store = export_live(config, cookies_path, pdf_dir)
 
     bundles = store.filtered(start, end)
-    write_orders_csv(csv_path, bundles)
-    write_order_lines_csv(order_lines_csv_path, bundles)
-    if config.xlsx:
-        write_xlsx(xlsx_path, bundles)
+    if config.input_har:
+        write_orders_csv(csv_path, bundles)
+        write_order_lines_csv(order_lines_csv_path, bundles)
+        if config.xlsx:
+            write_xlsx(xlsx_path, bundles)
 
     print(f"CSV written to {csv_path}")
     print(f"Order-line CSV written to {order_lines_csv_path}")
